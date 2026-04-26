@@ -1,0 +1,261 @@
+name: CR-Killer PR Reviewer
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Target repository in owner/name form (the repo containing the PR to review)."
+        required: true
+        default: "kousikmahadeva/cal_dot_com__cal.com__code-review-benchmark__PR7232__20260426"
+      pr_number:
+        description: "PR number in the target repository."
+        required: true
+      base_branch:
+        description: "Base branch the PR targets (for safety checks)."
+        required: false
+        default: "main"
+  # This trigger exists only so GitHub registers the workflow when first pushed
+  # on a non-default branch. It no-ops on normal code changes (paths filter).
+  push:
+    branches: [coderabbit_killer]
+    paths:
+      - .github/workflows/pr-reviewer.yml
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: cr-killer-reviewer-${{ github.event.inputs.target_repo }}-${{ github.event.inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TARGET_REPO: ${{ github.event.inputs.target_repo }}
+      PR_NUMBER: ${{ github.event.inputs.pr_number }}
+      TARGET_BASE_BRANCH: ${{ github.event.inputs.base_branch }}
+      BOT_MARKER_PREFIX: "cr-killer"
+    steps:
+      - name: Install Cursor Agent CLI
+        run: |
+          set -euo pipefail
+          curl https://cursor.com/install -fsSL | bash
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Validate secrets and runtime requirements
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_AUTOMATION_TOKEN: ${{ secrets.GH_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.local/bin:${PATH}"
+          if [[ -z "${CURSOR_API_KEY}" ]]; then
+            echo "Missing CURSOR_API_KEY secret."
+            exit 1
+          fi
+          if [[ -z "${GH_AUTOMATION_TOKEN}" ]]; then
+            echo "Missing GH_AUTOMATION_TOKEN secret."
+            exit 1
+          fi
+          if ! command -v agent >/dev/null 2>&1 && ! command -v cursor-agent >/dev/null 2>&1; then
+            echo "agent CLI not found in PATH."
+            exit 1
+          fi
+          if ! command -v agent >/dev/null 2>&1; then
+            ln -sf "$(command -v cursor-agent)" "${HOME}/.local/bin/agent"
+          fi
+          agent --version || true
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not found in PATH; required by post-review.py."
+            exit 1
+          fi
+          python3 --version
+
+      - name: Resolve PR metadata
+        id: pr_meta
+        env:
+          GH_TOKEN: ${{ secrets.GH_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(gh pr view "${PR_NUMBER}" \
+            --repo "${TARGET_REPO}" \
+            --json number,url,title,headRefName,baseRefName,headRefOid,headRepositoryOwner,isDraft,state)"
+
+          pr_state="$(jq -r '.state' <<< "${pr_json}")"
+          if [[ "${pr_state}" != "OPEN" ]]; then
+            echo "PR #${PR_NUMBER} is not OPEN (state=${pr_state}); refusing to review."
+            exit 1
+          fi
+
+          pr_base_ref="$(jq -r '.baseRefName' <<< "${pr_json}")"
+          if [[ "${pr_base_ref}" != "${TARGET_BASE_BRANCH}" ]]; then
+            echo "PR #${PR_NUMBER} targets '${pr_base_ref}', expected '${TARGET_BASE_BRANCH}'."
+            exit 1
+          fi
+
+          pr_head_owner="$(jq -r '.headRepositoryOwner.login // empty' <<< "${pr_json}")"
+          target_owner="${TARGET_REPO%%/*}"
+          if [[ -n "${pr_head_owner}" && "${pr_head_owner}" != "${target_owner}" ]]; then
+            echo "PR head is from fork owner '${pr_head_owner}'; MVP supports same-repo branches only."
+            exit 1
+          fi
+
+          pr_head_ref="$(jq -r '.headRefName' <<< "${pr_json}")"
+          pr_head_sha="$(jq -r '.headRefOid' <<< "${pr_json}")"
+          pr_url="$(jq -r '.url' <<< "${pr_json}")"
+          pr_title="$(jq -r '.title' <<< "${pr_json}")"
+
+          {
+            echo "number=${PR_NUMBER}"
+            echo "url=${pr_url}"
+            echo "title<<EOF"
+            echo "${pr_title}"
+            echo "EOF"
+            echo "head_ref=${pr_head_ref}"
+            echo "head_sha=${pr_head_sha}"
+            echo "base_ref=${pr_base_ref}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Reviewing PR #${PR_NUMBER} (${pr_url})"
+          echo "Head: ${pr_head_ref}@${pr_head_sha}"
+          echo "Base: ${pr_base_ref}"
+
+      - name: Checkout automation branch (contains scripts/pr-reviewer)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.GH_AUTOMATION_TOKEN }}
+
+      - name: Checkout target PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          fetch-depth: 0
+          ref: ${{ steps.pr_meta.outputs.head_ref }}
+          token: ${{ secrets.GH_AUTOMATION_TOKEN }}
+          path: workspace/target
+
+      - name: Prepare context (diff, prior comments, memory)
+        env:
+          GH_TOKEN: ${{ secrets.GH_AUTOMATION_TOKEN }}
+          HEAD_REF: ${{ steps.pr_meta.outputs.head_ref }}
+          BASE_REF: ${{ steps.pr_meta.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+
+          ctx_dir="${GITHUB_WORKSPACE}/workspace/context"
+          mkdir -p "${ctx_dir}"
+
+          pushd "${GITHUB_WORKSPACE}/workspace/target" >/dev/null
+          git fetch origin "${BASE_REF}":"refs/remotes/origin/${BASE_REF}" --depth=0 || git fetch origin "${BASE_REF}"
+          merge_base="$(git merge-base "origin/${BASE_REF}" HEAD)"
+          echo "Merge base: ${merge_base}"
+          git diff --no-color "${merge_base}"...HEAD > "${ctx_dir}/pr_diff.patch"
+          git diff --name-only "${merge_base}"...HEAD > "${ctx_dir}/changed_files.txt"
+          echo "${merge_base}" > "${ctx_dir}/merge_base.txt"
+          popd >/dev/null
+
+          gh api --paginate \
+            "repos/${TARGET_REPO}/pulls/${PR_NUMBER}/comments" \
+            > "${ctx_dir}/prior_comments_raw.json"
+
+          jq '[ .[] | select(.body | test("<!--\\s*cr-killer:concern-id=")) ]' \
+            "${ctx_dir}/prior_comments_raw.json" > "${ctx_dir}/prior_comments.json"
+
+          if [[ -f "${GITHUB_WORKSPACE}/workspace/target/memory.md" ]]; then
+            cp "${GITHUB_WORKSPACE}/workspace/target/memory.md" "${ctx_dir}/memory.md"
+          else
+            echo "# Repo memory (seed)" > "${ctx_dir}/memory.md"
+            echo "" >> "${ctx_dir}/memory.md"
+            echo "No memory.md present in target repo yet; reviewer will operate without historical context." >> "${ctx_dir}/memory.md"
+          fi
+
+          if [[ -f "${GITHUB_WORKSPACE}/workspace/target/.cursor/rules/projectrules.mdc" ]]; then
+            cp "${GITHUB_WORKSPACE}/workspace/target/.cursor/rules/projectrules.mdc" "${ctx_dir}/projectrules.mdc"
+          else
+            : > "${ctx_dir}/projectrules.mdc"
+          fi
+
+          echo "--- pr_diff.patch ---"
+          wc -l "${ctx_dir}/pr_diff.patch"
+          echo "--- changed_files.txt ---"
+          cat "${ctx_dir}/changed_files.txt"
+          echo "--- prior_comments.json (cr-killer only) ---"
+          jq 'length' "${ctx_dir}/prior_comments.json"
+
+      - name: Preflight (abort before agent if context is missing or fetch flaked)
+        env:
+          HEAD_SHA: ${{ steps.pr_meta.outputs.head_sha }}
+          HEAD_REF: ${{ steps.pr_meta.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error title=CR-Killer preflight failed::$1"
+            echo ""
+            echo "Aborting BEFORE the agent runs to avoid burning LLM tokens."
+            echo "Re-dispatch the workflow once the underlying issue (e.g. a transient"
+            echo "GitHub 5xx during checkout) clears."
+            exit 1
+          }
+
+          target_dir="${GITHUB_WORKSPACE}/workspace/target"
+          ctx_dir="${GITHUB_WORKSPACE}/workspace/context"
+
+          [[ -d "${target_dir}/.git" ]] || fail "target repo was not cloned: ${target_dir} missing .git (checkout likely hit a 5xx or auth error)."
+
+          actual_sha="$(git -C "${target_dir}" rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${HEAD_SHA}" ]]; then
+            fail "target HEAD mismatch: got ${actual_sha}, expected ${HEAD_SHA} (ref=${HEAD_REF}). Checkout likely truncated after a retry."
+          fi
+
+          [[ -s "${ctx_dir}/pr_diff.patch" ]] || fail "pr_diff.patch is missing or empty. Either the base branch failed to fetch or the PR has no changes."
+          [[ -s "${ctx_dir}/changed_files.txt" ]] || fail "changed_files.txt is missing or empty."
+
+          if grep -Eq '^(fatal:|remote: Internal Server Error|error: RPC failed)' "${ctx_dir}/pr_diff.patch"; then
+            fail "pr_diff.patch contains fatal/remote error lines; the diff computation was corrupted."
+          fi
+
+          echo "Preflight passed:"
+          echo "  target HEAD: ${actual_sha}"
+          echo "  pr_diff.patch: $(wc -l < "${ctx_dir}/pr_diff.patch") lines"
+          echo "  changed_files.txt: $(wc -l < "${ctx_dir}/changed_files.txt") files"
+
+      - name: Run Cursor agent reviewer
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          AGENT_WORKSPACE: ${{ github.workspace }}/workspace
+          TARGET_REPO_PATH: ${{ github.workspace }}/workspace/target
+          CONTEXT_DIR: ${{ github.workspace }}/workspace/context
+          PROMPT_PATH: ${{ github.workspace }}/scripts/pr-reviewer/prompts/reviewer.md
+          CONCERNS_OUT: ${{ github.workspace }}/workspace/context/concerns.json
+          SOURCE_PR_REPO: ${{ env.TARGET_REPO }}
+          SOURCE_PR_NUMBER: ${{ steps.pr_meta.outputs.number }}
+          SOURCE_PR_URL: ${{ steps.pr_meta.outputs.url }}
+          SOURCE_PR_HEAD_REF: ${{ steps.pr_meta.outputs.head_ref }}
+          SOURCE_PR_HEAD_SHA: ${{ steps.pr_meta.outputs.head_sha }}
+          SOURCE_PR_BASE_REF: ${{ steps.pr_meta.outputs.base_ref }}
+          AGENT_MODE: "review"
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/scripts/pr-reviewer/review.sh"
+
+      - name: Post review (reconcile prior, post new)
+        env:
+          GH_TOKEN: ${{ secrets.GH_AUTOMATION_TOKEN }}
+          TARGET_REPO: ${{ env.TARGET_REPO }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.number }}
+          HEAD_SHA: ${{ steps.pr_meta.outputs.head_sha }}
+          CONCERNS_PATH: ${{ github.workspace }}/workspace/context/concerns.json
+          PRIOR_COMMENTS_PATH: ${{ github.workspace }}/workspace/context/prior_comments.json
+          DIFF_PATH: ${{ github.workspace }}/workspace/context/pr_diff.patch
+          MARKER_PREFIX: ${{ env.BOT_MARKER_PREFIX }}
+        run: |
+          set -euo pipefail
+          python3 "${GITHUB_WORKSPACE}/scripts/pr-reviewer/post-review.py"
